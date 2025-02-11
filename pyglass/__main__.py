@@ -27,6 +27,12 @@ async def main():
     try:
         while True:
             await glasses.send_heartbeat()
+            test_message = "Hello, World! This is a test message from pyglass."
+            success = await glasses.send_text(test_message)
+            if success:
+                clog.info(f"Message sent: {test_message}")
+            else:
+                clog.error("Failed to send message.")
             await asyncio.sleep(8)
     except asyncio.CancelledError:
         clog.info("Received cancellation, exiting cleanly.")

@@ -2,6 +2,7 @@ import asyncio
 from pprint import pformat
 from bleak import BleakClient, BleakScanner, BleakError, BleakGATTCharacteristic
 from struct import pack
+import time
 from pyglass.modules.logger import Logger
 from pyglass.modules.commands import Commands, DeviceOrders, DisplayStatus
 
@@ -21,6 +22,9 @@ class Glasses:
         self.right: BleakClient = None
         self.both_connected: bool = False
         self.heartbeat_seq: int = 0
+        self._evenai_seq: int = 0
+        self._received_ack: bool = False
+        self._last_device_order: DeviceOrders = None
         self.flog, self.clog = Logger().get_loggers()
 
     async def scan(self, timeout=10):
@@ -116,11 +120,23 @@ class Glasses:
                 self.clog.debug("Received mic data.")
                 self.clog.debug(data[1:].hex())
             case Commands.BLE_REQ_EVENAI:
-                self.clog.debug("Received AI data.")
+                self.clog.debug("Received EvenAI data.")
+
+                if len(data) > 1 and data[1] == DeviceOrders.ORDER_RECIEVED:
+                    self._received_ack = True
             case Commands.BLE_REQ_DEVICE_ORDER:
                 self.clog.debug("Received device order.")
+                order = data[1]
+                self._last_device_order = order
+                self.clog.debug(f"Order: {DeviceOrders(order).name}")
+                if order == DeviceOrders.DISPLAY_COMPLETE:
+                    self._received_ack = True
             case _:
                 self.clog.debug("Received unknown command.")
+                try:
+                    self.clog.debug(f"{Commands(cmd).name}")
+                except ValueError:
+                    self.clog.debug(f"Unknown command: {cmd}")
                 self.clog.debug(data.hex())
 
     async def send_heartbeat(self):
@@ -144,3 +160,188 @@ class Glasses:
         await self.left.write_gatt_char(UART_TX_CHAR_UUID, data)
         await self.right.write_gatt_char(UART_TX_CHAR_UUID, data)
         self.clog.debug("Sent heartbeat.")
+
+    async def send_text(
+        self,
+        text,
+        new_screen: int = 1,
+        pos: int = 0,
+        current_page: int = 1,
+        max_pages: int = 1,
+    ):
+        lines = self._format_text_lines(text)
+        total_pages = (len(lines) + 4) // 5  # 5 lines per page
+
+        if len(lines) <= 3:
+            # Special formatting for short messages
+            display_text = "\n\n" + "\n".join(lines)
+            # Send initial display
+            success = await self._send_text_packet(
+                display_text,
+                new_screen=1,
+                status=DisplayStatus.NORMAL_TEXT,
+                current_page=1,
+                max_pages=1,
+            )
+            if not success:
+                return False
+
+            # Wait 3 seconds then send final display
+            await asyncio.sleep(3)
+            success = await self._send_text_packet(
+                display_text,
+                new_screen=1,
+                status=DisplayStatus.FINAL_TEXT,
+                current_page=1,
+                max_pages=1,
+            )
+            return success
+
+        elif len(lines) <= 5:
+            # Format for 4-5 lines
+            padding = "\n" if len(lines) == 4 else ""
+            display_text = padding + "\n".join(lines)
+
+            # Send initial display
+            success = await self._send_text_packet(
+                display_text,
+                new_screen=1,
+                status=DisplayStatus.NORMAL_TEXT,
+                current_page=1,
+                max_pages=1,
+            )
+            if not success:
+                return False
+
+            # Wait 3 seconds then send final display
+            await asyncio.sleep(3)
+            success = await self._send_text_packet(
+                display_text,
+                new_screen=1,
+                status=DisplayStatus.FINAL_TEXT,
+                current_page=1,
+                max_pages=1,
+            )
+            return success
+
+        else:
+            # Multi-page display
+            current_page = 1
+            start_idx = 0
+
+            while start_idx < len(lines):
+                page_lines = lines[start_idx : start_idx + 5]
+                display_text = "\n".join(page_lines)
+
+                is_last_page = start_idx + 5 >= len(lines)
+                status = (
+                    DisplayStatus.FINAL_TEXT
+                    if is_last_page
+                    else DisplayStatus.NORMAL_TEXT
+                )
+
+                success = await self._send_text_packet(
+                    display_text,
+                    new_screen=1,
+                    status=status,
+                    current_page=current_page,
+                    max_pages=total_pages,
+                )
+                if not success:
+                    return False
+
+                if not is_last_page:
+                    await asyncio.sleep(5)  # Wait 5 seconds between pages
+
+                start_idx += 5
+                current_page += 1
+
+            return True
+
+    def _format_text_lines(self, text):
+        """Format text into lines that fit the display"""
+        # Split text into paragraphs
+        paragraphs = [p.strip() for p in text.split("\n") if p.strip()]
+        lines = []
+
+        for paragraph in paragraphs:
+            # Simple line wrapping at ~40 characters
+            # In real implementation, should use proper text measurement
+            while len(paragraph) > 40:
+                space_idx = paragraph.rfind(" ", 0, 40)
+                if space_idx == -1:
+                    space_idx = 40
+                lines.append(paragraph[:space_idx])
+                paragraph = paragraph[space_idx:].strip()
+            if paragraph:
+                lines.append(paragraph)
+
+        return lines
+
+    async def _send_text_packet(
+        self, text, new_screen, status, current_page, max_pages
+    ):
+        """Send a single text packet with proper formatting"""
+        text_bytes = text.encode("utf-8")
+        max_chunk_size = 191
+
+        chunks = [
+            text_bytes[i : i + max_chunk_size]
+            for i in range(0, len(text_bytes), max_chunk_size)
+        ]
+
+        # Send to Left first
+        for i, chunk in enumerate(chunks):
+            self._received_ack = False
+            header = pack(
+                ">BBBBBBBB",
+                Commands.BLE_REQ_EVENAI,
+                self._evenai_seq & 0xFF,
+                len(chunks),
+                i,
+                status | new_screen,  # Combine status and new_screen
+                0,  # pos high byte
+                0,  # pos low byte
+                current_page,
+            )
+            packet = header + bytes([max_pages]) + chunk
+
+            await self.left.write_gatt_char(UART_TX_CHAR_UUID, packet)
+            if not await self._wait_for_display_complete(timeout=2.0):
+                return False
+
+            await asyncio.sleep(0.1)
+
+        # Send to Right after Left completes
+        for i, chunk in enumerate(chunks):
+            self._received_ack = False
+            header = pack(
+                ">BBBBBBBB",
+                Commands.BLE_REQ_EVENAI,
+                self._evenai_seq & 0xFF,
+                len(chunks),
+                i,
+                status | new_screen,
+                0,
+                0,
+                current_page,
+            )
+            packet = header + bytes([max_pages]) + chunk
+
+            await self.right.write_gatt_char(UART_TX_CHAR_UUID, packet)
+            if not await self._wait_for_display_complete(timeout=2.0):
+                return False
+
+            await asyncio.sleep(0.1)
+
+        self._evenai_seq += 1
+        return True
+
+    async def _wait_for_display_complete(self, timeout=2.0):
+        """Wait for display complete status"""
+        start_time = time.time()
+        while time.time() - start_time < timeout:
+            if self._received_ack:
+                return True
+            await asyncio.sleep(0.1)
+        return False

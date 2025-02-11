@@ -1,5 +1,6 @@
 from enum import IntEnum
 
+
 class Commands(IntEnum):
     # System commands
     BLE_REQ_INIT = 0x4D
@@ -22,6 +23,7 @@ class DeviceOrders(IntEnum):
     DISPLAY_BUSY = 0x11
     DISPLAY_UPDATE = 0x0F
     DISPLAY_COMPLETE = 0x09
+    ORDER_RECIEVED = 0xC9
 
 
 class DisplayStatus(IntEnum):
