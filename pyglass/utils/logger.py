@@ -43,7 +43,9 @@ class Logger:
         self.console_logger.setLevel(log_level)
         self.console_logger.handlers.clear()
         self.console_logger.propagate = False
-        rich_handler = RichHandler(show_time=False, show_path=False, markup=True)
+        # rich_handler = RichHandler(show_time=False, show_path=False, markup=True)
+        rich_handler = RichHandler(show_time=False, markup=True)
+
         self.console_logger.addHandler(rich_handler)
 
         # File logger with file handler and formatter

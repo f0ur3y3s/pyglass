@@ -1,10 +1,17 @@
 import asyncio
 from pprint import pformat
-from bleak import BleakClient, BleakScanner, BleakError, BleakGATTCharacteristic
+from bleak import (
+    BleakClient,
+    BleakScanner,
+    BleakError,
+    BleakGATTCharacteristic,
+    BLEDevice,
+)
 from struct import pack
 import time
-from pyglass.modules.logger import Logger
-from pyglass.modules.commands import Commands, DeviceOrders, DisplayStatus
+from pyglass.utils.logger import Logger
+from pyglass.modules.packets import Packet, Heartbeat
+from pyglass.commands.commands import Commands, DeviceOrders, DisplayStatus
 
 UART_SERVICE_UUID = "6E400001-B5A3-F393-E0A9-E50E24DCCA9E"
 UART_TX_CHAR_UUID = "6E400002-B5A3-F393-E0A9-E50E24DCCA9E"  # Write
@@ -27,9 +34,8 @@ class Glasses:
         self._last_device_order: DeviceOrders = None
         self.flog, self.clog = Logger().get_loggers()
 
-    async def scan(self, timeout=10):
+    async def scan(self, timeout: int = 10):
         self.clog.debug("Starting scan")
-
         try:
             await asyncio.wait_for(self._scan_loop(), timeout=timeout)
         except asyncio.TimeoutError:
@@ -38,27 +44,26 @@ class Glasses:
     async def _scan_loop(self):
         while True:
             devices = await BleakScanner.discover()
-
             for device in devices:
-                if not device.name:
-                    continue
-
-                lower_name = str(device.name).lower()
-
-                if "_l_" in lower_name and "even" in lower_name:
-                    self.clog.info(f"Found left device: {device.name}")
-                    self.left = BleakClient(device)
-                elif "_r_" in lower_name and "even" in lower_name:
-                    self.clog.info(f"Found right device: {device.name}")
-                    self.right = BleakClient(device)
-
+                if device.name:
+                    await self._identify_and_assign_device(device)
             if self.left and self.right:
                 self.clog.info("Found both devices.")
                 break
 
+    async def _identify_and_assign_device(self, device: BLEDevice):
+        lower_name = str(device.name).lower()
+        if "_l_" in lower_name and "even" in lower_name:
+            self.clog.info(f"Found left device: {device.name}")
+            self.left = BleakClient(device)
+        elif "_r_" in lower_name and "even" in lower_name:
+            self.clog.info(f"Found right device: {device.name}")
+            self.right = BleakClient(device)
+
     async def connect(self, scan: bool = False):
         if not scan and (not self.left or not self.right):
             self.clog.error("Cannot connect without both devices.")
+            return
 
         if scan:
             self.clog.debug("Scanning for devices before connecting.")
@@ -71,27 +76,26 @@ class Glasses:
             raise
 
     async def _connect_loop(self):
-        self.clog.debug("Connecting to left device.")
-        await self.left.connect()
-
-        self.clog.debug("Connecting to right device.")
-        await self.right.connect()
-
+        await self._connect_to_device(self.left, "left")
+        await self._connect_to_device(self.right, "right")
         await self._initialize()
         self.clog.info("Connected to both devices.")
         self.both_connected = True
         self.heartbeat_seq = 0
 
+    async def _connect_to_device(self, device: BleakClient, side: str):
+        self.clog.debug(f"Connecting to {side} device.")
+        await device.connect()
+
     async def disconnect(self):
-        if self.left:
-            await self.left.disconnect()
-            self.clog.info("Disconnected from left device.")
-
-        if self.right:
-            await self.right.disconnect()
-            self.clog.info("Disconnected from right device.")
-
+        await self._disconnect_device(self.left, "left")
+        await self._disconnect_device(self.right, "right")
         self.clog.info("Disconnected from both devices.")
+
+    async def _disconnect_device(self, device: BleakClient, side: str):
+        if device:
+            await device.disconnect()
+            self.clog.info(f"Disconnected from {side} device.")
 
     async def _initialize(self):
         init_data = bytes([Commands.BLE_REQ_INIT, 0x01])
@@ -101,18 +105,16 @@ class Glasses:
         await self.right.start_notify(UART_RX_CHAR_UUID, self._notification_handler)
 
     async def _notification_handler(
-        self,
-        sender: BleakGATTCharacteristic,
-        data: bytearray,
+        self, sender: BleakGATTCharacteristic, data: bytearray
     ):
         if not self.both_connected:
             self.clog.debug("Waiting for both devices to connect.")
             await self.connect()
-
         self.clog.debug(pformat(data))
+        await self._handle_notification_command(data)
 
+    async def _handle_notification_command(self, data):
         cmd = data[0]
-
         match cmd:
             case Commands.BLE_REQ_HEARTBEAT:
                 self.clog.debug("Received heartbeat.")
@@ -120,24 +122,25 @@ class Glasses:
                 self.clog.debug("Received mic data.")
                 self.clog.debug(data[1:].hex())
             case Commands.BLE_REQ_EVENAI:
-                self.clog.debug("Received EvenAI data.")
-
-                if len(data) > 1 and data[1] == DeviceOrders.ORDER_RECIEVED:
-                    self._received_ack = True
+                await self._handle_evenai(data)
             case Commands.BLE_REQ_DEVICE_ORDER:
-                self.clog.debug("Received device order.")
-                order = data[1]
-                self._last_device_order = order
-                self.clog.debug(f"Order: {DeviceOrders(order).name}")
-                if order == DeviceOrders.DISPLAY_COMPLETE:
-                    self._received_ack = True
+                await self._handle_device_order(data)
             case _:
                 self.clog.debug("Received unknown command.")
-                try:
-                    self.clog.debug(f"{Commands(cmd).name}")
-                except ValueError:
-                    self.clog.debug(f"Unknown command: {cmd}")
                 self.clog.debug(data.hex())
+
+    async def _handle_evenai(self, data):
+        self.clog.debug("Received EvenAI data.")
+        if len(data) > 1 and data[1] == DeviceOrders.ORDER_RECIEVED:
+            self._received_ack = True
+
+    async def _handle_device_order(self, data):
+        self.clog.debug("Received device order.")
+        order = data[1]
+        self._last_device_order = order
+        # self.clog.debug(f"Order: {DeviceOrders(order).name}")
+        if order == DeviceOrders.DISPLAY_COMPLETE:
+            self._received_ack = True
 
     async def send_heartbeat(self):
         if not self.both_connected:
@@ -145,21 +148,14 @@ class Glasses:
             await self.connect()
             return
 
-        length = 6
-        data = pack(
-            "BBBBBB",
-            Commands.BLE_REQ_HEARTBEAT,
-            length & 0xFF,
-            (length >> 8) & 0xFF,
-            self.heartbeat_seq % 0xFF,
-            0x04,
-            self.heartbeat_seq % 0xFF,
-        )
-        self.heartbeat_seq += 1
+        heartbeat = Heartbeat(self.heartbeat_seq)
+        data = heartbeat.pack()
+        await self._send_data_to_devices(data, "heartbeat")
 
-        await self.left.write_gatt_char(UART_TX_CHAR_UUID, data)
-        await self.right.write_gatt_char(UART_TX_CHAR_UUID, data)
-        self.clog.debug("Sent heartbeat.")
+    async def _send_data_to_devices(self, data, command):
+        for device in [self.left, self.right]:
+            await device.write_gatt_char(UART_TX_CHAR_UUID, data)
+            self.clog.debug(f"Sent {command} command to device.")
 
     async def send_text(
         self,
@@ -171,92 +167,76 @@ class Glasses:
     ):
         lines = self._format_text_lines(text)
         total_pages = (len(lines) + 4) // 5  # 5 lines per page
+        await self._send_text_pages(
+            lines, new_screen, pos, current_page, max_pages, total_pages
+        )
 
-        if len(lines) <= 3:
-            # Special formatting for short messages
-            display_text = "\n\n" + "\n".join(lines)
-            # Send initial display
+    async def _send_text_pages(
+        self, lines, new_screen, pos, current_page, max_pages, total_pages
+    ):
+        # Refactored paging logic
+        start_idx = 0
+        while start_idx < len(lines):
+            page_lines = lines[start_idx : start_idx + 5]
+            display_text = "\n".join(page_lines)
+            is_last_page = start_idx + 5 >= len(lines)
+            status = (
+                DisplayStatus.FINAL_TEXT if is_last_page else DisplayStatus.NORMAL_TEXT
+            )
             success = await self._send_text_packet(
-                display_text,
-                new_screen=1,
-                status=DisplayStatus.NORMAL_TEXT,
-                current_page=1,
-                max_pages=1,
+                display_text, new_screen, status, current_page, total_pages
             )
             if not success:
                 return False
+            await asyncio.sleep(5 if not is_last_page else 0)
+            start_idx += 5
+            current_page += 1
+        return True
 
-            # Wait 3 seconds then send final display
-            await asyncio.sleep(3)
-            success = await self._send_text_packet(
-                display_text,
-                new_screen=1,
-                status=DisplayStatus.FINAL_TEXT,
-                current_page=1,
-                max_pages=1,
-            )
-            return success
+    async def _send_text_packet(
+        self, text, new_screen, status, current_page, max_pages
+    ):
+        text_bytes = text.encode("utf-8")
+        max_chunk_size = 191
+        chunks = [
+            text_bytes[i : i + max_chunk_size]
+            for i in range(0, len(text_bytes), max_chunk_size)
+        ]
+        await self._send_chunks_to_devices(
+            chunks, new_screen, status, current_page, max_pages
+        )
+        return True
 
-        elif len(lines) <= 5:
-            # Format for 4-5 lines
-            padding = "\n" if len(lines) == 4 else ""
-            display_text = padding + "\n".join(lines)
-
-            # Send initial display
-            success = await self._send_text_packet(
-                display_text,
-                new_screen=1,
-                status=DisplayStatus.NORMAL_TEXT,
-                current_page=1,
-                max_pages=1,
-            )
-            if not success:
-                return False
-
-            # Wait 3 seconds then send final display
-            await asyncio.sleep(3)
-            success = await self._send_text_packet(
-                display_text,
-                new_screen=1,
-                status=DisplayStatus.FINAL_TEXT,
-                current_page=1,
-                max_pages=1,
-            )
-            return success
-
-        else:
-            # Multi-page display
-            current_page = 1
-            start_idx = 0
-
-            while start_idx < len(lines):
-                page_lines = lines[start_idx : start_idx + 5]
-                display_text = "\n".join(page_lines)
-
-                is_last_page = start_idx + 5 >= len(lines)
-                status = (
-                    DisplayStatus.FINAL_TEXT
-                    if is_last_page
-                    else DisplayStatus.NORMAL_TEXT
+    async def _send_chunks_to_devices(
+        self, chunks, new_screen, status, current_page, max_pages
+    ):
+        for device in [self.left, self.right]:
+            for i, chunk in enumerate(chunks):
+                header = pack(
+                    ">BBBBBBBB",
+                    Commands.BLE_REQ_EVENAI,
+                    self._evenai_seq & 0xFF,
+                    len(chunks),
+                    i,
+                    status | new_screen,
+                    0,
+                    0,
+                    current_page,
                 )
-
-                success = await self._send_text_packet(
-                    display_text,
-                    new_screen=1,
-                    status=status,
-                    current_page=current_page,
-                    max_pages=total_pages,
-                )
-                if not success:
+                packet = header + bytes([max_pages]) + chunk
+                await device.write_gatt_char(UART_TX_CHAR_UUID, packet)
+                if not await self._wait_for_display_complete(timeout=2.0):
                     return False
+                await asyncio.sleep(0.1)
+        self._evenai_seq += 1
 
-                if not is_last_page:
-                    await asyncio.sleep(5)  # Wait 5 seconds between pages
-
-                start_idx += 5
-                current_page += 1
-
-            return True
+    async def _wait_for_display_complete(self, timeout=2.0):
+        start_time = time.time()
+        while time.time() - start_time < timeout:
+            if self._received_ack:
+                return True
+            await asyncio.sleep(0.1)
+        return False
 
     def _format_text_lines(self, text):
         """Format text into lines that fit the display"""
@@ -278,70 +258,12 @@ class Glasses:
 
         return lines
 
-    async def _send_text_packet(
-        self, text, new_screen, status, current_page, max_pages
-    ):
-        """Send a single text packet with proper formatting"""
-        text_bytes = text.encode("utf-8")
-        max_chunk_size = 191
+    async def send_packet(self, packet: Packet):
+        if not self.both_connected:
+            self.clog.error("Cannot send packet without both devices connected.")
+            await self.connect()
+            return
 
-        chunks = [
-            text_bytes[i : i + max_chunk_size]
-            for i in range(0, len(text_bytes), max_chunk_size)
-        ]
-
-        # Send to Left first
-        for i, chunk in enumerate(chunks):
-            self._received_ack = False
-            header = pack(
-                ">BBBBBBBB",
-                Commands.BLE_REQ_EVENAI,
-                self._evenai_seq & 0xFF,
-                len(chunks),
-                i,
-                status | new_screen,  # Combine status and new_screen
-                0,  # pos high byte
-                0,  # pos low byte
-                current_page,
-            )
-            packet = header + bytes([max_pages]) + chunk
-
-            await self.left.write_gatt_char(UART_TX_CHAR_UUID, packet)
-            if not await self._wait_for_display_complete(timeout=2.0):
-                return False
-
-            await asyncio.sleep(0.1)
-
-        # Send to Right after Left completes
-        for i, chunk in enumerate(chunks):
-            self._received_ack = False
-            header = pack(
-                ">BBBBBBBB",
-                Commands.BLE_REQ_EVENAI,
-                self._evenai_seq & 0xFF,
-                len(chunks),
-                i,
-                status | new_screen,
-                0,
-                0,
-                current_page,
-            )
-            packet = header + bytes([max_pages]) + chunk
-
-            await self.right.write_gatt_char(UART_TX_CHAR_UUID, packet)
-            if not await self._wait_for_display_complete(timeout=2.0):
-                return False
-
-            await asyncio.sleep(0.1)
-
-        self._evenai_seq += 1
-        return True
-
-    async def _wait_for_display_complete(self, timeout=2.0):
-        """Wait for display complete status"""
-        start_time = time.time()
-        while time.time() - start_time < timeout:
-            if self._received_ack:
-                return True
-            await asyncio.sleep(0.1)
-        return False
+        data = packet.pack()
+        await self._send_data_to_devices(data, "packet")
+        self.clog.debug(f"Sent packet: {packet}")

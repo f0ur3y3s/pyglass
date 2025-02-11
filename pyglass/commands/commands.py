@@ -31,3 +31,8 @@ class DisplayStatus(IntEnum):
     FINAL_TEXT = 0x40  # Final display after 3 seconds
     MANUAL_PAGE = 0x50  # Manual page turning mode
     ERROR_TEXT = 0x60  # Error display
+    TEXT_SHOW = 0x70  # Text display
+
+
+class ScreenAction(IntEnum):
+    NEW_CONTENT = 0x01

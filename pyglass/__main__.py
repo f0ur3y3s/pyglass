@@ -1,7 +1,8 @@
 import asyncio
-from pyglass.modules.argparser import parse_args
-from pyglass.modules.logger import Logger
+from pyglass.utils.argparser import parse_args
+from pyglass.utils.logger import Logger
 from pyglass.modules.glasses import Glasses
+from pyglass.modules.packets import Packet, Text
 
 
 async def main():
@@ -27,13 +28,28 @@ async def main():
     try:
         while True:
             await glasses.send_heartbeat()
-            test_message = "Hello, World! This is a test message from pyglass."
-            success = await glasses.send_text(test_message)
-            if success:
-                clog.info(f"Message sent: {test_message}")
-            else:
-                clog.error("Failed to send message.")
-            await asyncio.sleep(8)
+            # test_message = "Hello, World! This is a test message from pyglass."
+            # success = await glasses.send_text(test_message)
+            # if success:
+            #     clog.info(f"Message sent: {test_message}")
+            # else:
+            #     clog.error("Failed to send message.")
+            # deadline_u32_seconds = hex(1739260938)[2:].encode()
+            # test_countdown: Packet = Packet(
+            #     cid=0x07,
+            #     length=0x0005,
+            #     seq_id=0x01,
+            #     subcommand=0x01,
+            #     # data=b"\x00\x00\x00\x00\x00",
+            #     data=deadline_u32_seconds,
+            # )
+            # await glasses.send_packet(test_countdown)
+            test_text: Text = Text(
+                glasses._evenai_seq,
+                "Hello, World! This is a test message from pyglass.",
+            )
+            await glasses.send_packet(test_text)
+            await asyncio.sleep(8)  # for heartbeat
     except asyncio.CancelledError:
         clog.info("Received cancellation, exiting cleanly.")
     except KeyboardInterrupt:
